@@ -1,0 +1,74 @@
+###   This play requires that the person executing the playbook has a local svc account they can use and knows how to reach their Isilon Storage Array (IP Addr). Also must know what logical access zones have been configured. In the vars prompt and in plays we see there are two access zones set up, 1 for Non production (Dev-AZ) and one for Production (Prod-AZ).    ###
+
+---
+- name: List All Isilon NFS Exports in an Access Zone
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars_prompt:
+    - name: isilon_host
+      prompt: "Enter your Isilon node IP or hostname"
+      private: no
+    - name: isilon_user
+      prompt: "Enter your Isilon username"
+      private: no
+    - name: isilon_password
+      prompt: "Enter your Isilon password"
+      private: yes
+    - name: az_choice
+      prompt: "Select Access Zone:\n  1) Dev-AZ\n  2) Prod-AZ\nEnter choice (1 or 2)"
+      private: no
+
+  vars:
+    api_version: "10"
+    output_file: "all_exports.txt" # <-- This file will have the list of all available mount points for your linux servers.
+
+  tasks:
+    - name: Initialize or clear the results file
+      ansible.builtin.copy:
+        content: "# Isilon NFS Export List\n# Playbook run on: {{ ansible_date_time.iso8601 }}\n\n"
+        dest: "{{ output_file }}"
+        mode: '0644'
+
+    - name: Set Access Zone based on user selection
+      ansible.builtin.set_fact:
+        access_zone: "{{ 'Dev-AZ' if az_choice == '1' else 'Prod-AZ' }}"
+      when: az_choice in ['1', '2']
+
+    - name: Fail on invalid Access Zone selection
+      ansible.builtin.fail:
+        msg: "Invalid selection. You must enter '1' for Dev-AZ or '2' for Prod-AZ."
+      when: az_choice not in ['1', '2']
+
+    - name: Get all NFS exports from the specified access zone
+      ansible.builtin.uri:
+        url: "https://{{ isilon_host }}:8080/platform/{{ api_version }}/protocols/nfs/exports?zone={{ access_zone }}"
+        user: "{{ isilon_user }}"
+        password: "{{ isilon_password }}"
+        method: GET
+        validate_certs: no
+        force_basic_auth: yes
+      register: nfs_exports_response
+      ignore_errors: yes
+
+    - name: Fail on API communication errors
+      ansible.builtin.fail:
+        msg: "Failed to communicate with Isilon. Status: {{ nfs_exports_response.status }}, Msg: {{ nfs_exports_response.msg | default('N/A') }}"
+      when: nfs_exports_response.status not in [200]
+
+    - name: Write all exports and their paths to file
+      when:
+        - nfs_exports_response.json is defined
+        - nfs_exports_response.json.exports is defined
+      loop: "{{ nfs_exports_response.json.exports }}"
+      loop_control:
+        label: "{{ item.paths[0] | default('NO_PATH_DEFINED') }}"
+      ansible.builtin.lineinfile:
+        path: "{{ output_file }}"
+        line: "Export ID: {{ item.id }} | Path: {{ item.paths[0] }}"
+        create: yes
+
+    - name: Final message
+      ansible.builtin.debug:
+        msg: "Playbook has completed. A full list of exports is in '{{ output_file }}'."
