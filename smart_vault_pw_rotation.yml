@@ -1,0 +1,161 @@
+### This playbook purpose is to query a secret in hashicorp vault that is widespread across an enterprise, in this case its for rotating the local root passwords on RHEL systems as well as a breakglass local account with SSH capability called admin_local. This gets ran pretty much any time a privileged user quits or is fired from the enterprise. It has a couple prerequisites, one being that the user has an access policy set up in hashicorp vault and an approle that is tied to it. The other being that the user put the vault_role_id of that app role and the vault_secret_id into an ansible vault in the user's home directory.
+
+---
+- name: Rotate or Enforce Local Account Passwords from Vault
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - ~/vault.yml
+
+  vars:
+    vault_addr: "https://samplevaultserver.yourdomain"     #These will need to be set per enclave unless we use a prompt instead.
+    vault_secret_mount: "your_vault_secret_mount"
+    vault_secret_path: "your_vault_secret"
+
+  pre_tasks:
+    # --- STAGE 1: AUTHENTICATE AND GET METADATA ---
+    - name: Get client token from Vault AppRole
+      uri:
+        url: "{{ vault_addr }}/v1/auth/approle/login"
+        method: POST
+        body_format: json
+        body:
+          role_id: "{{ vault_role_id }}"
+          secret_id: "{{ vault_secret_id }}"
+        status_code: 200
+      register: vault_login_response
+      no_log: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set Vault token fact
+      set_fact:
+        vault_token: "{{ vault_login_response.json.auth.client_token }}"
+      no_log: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: Retrieve the METADATA for 'your_vault_secret'
+      uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_mount }}/metadata/{{ vault_secret_path }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        status_code: 200
+      register: vm_secrets_metadata
+      no_log: true
+      run_once: true
+      delegate_to: localhost
+
+    # --- STAGE 2: PROMPT OPERATOR FOR DECISION ---
+    - name: Get the creation time string
+      set_fact:
+        secret_created_time: "{{ vm_secrets_metadata.json.data.versions[vm_secrets_metadata.json.data.current_version | string].created_time }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Ask operator if rotation should proceed
+      pause:
+        prompt: |
+          The current secret was created on: {{ secret_created_time }}
+          Do you want to rotate the passwords now? [yes/no]
+      register: a_user_wants_to_rotate
+      run_once: true
+      delegate_to: localhost
+
+    # --- STAGE 3: CONDITIONAL ROTATION BLOCK ---
+    # The following tasks will ONLY run if the operator typed 'yes'.
+    - block:
+      - name: Securely prompt for new root password
+        pause:
+          prompt: "ROTATION CONFIRMED: Enter the NEW password for the 'root' user"
+          echo: no
+        register: new_root_password_prompt
+
+      - name: Securely prompt for new admin_local password
+        pause:
+          prompt: "ROTATION CONFIRMED: Enter the NEW password for the 'admin_local' user"
+          echo: no
+        register: new_admin_local_password_prompt
+
+      - name: Update secrets in Vault with new passwords
+        uri:
+          url: "{{ vault_addr }}/v1/{{ vault_secret_mount }}/data/{{ vault_secret_path }}"
+          method: POST
+          headers:
+            X-Vault-Token: "{{ vault_token }}"
+          body_format: json
+          body:
+            data:
+              admin_local: "{{ new_admin_local_password_prompt.user_input }}"
+              root: "{{ new_root_password_prompt.user_input }}"
+        no_log: true
+
+      run_once: true
+      delegate_to: localhost
+      when: a_user_wants_to_rotate.user_input | lower == 'yes'
+
+    # --- STAGE 4: FETCH FINAL SECRET VALUES & APPLY ---
+    # This block runs UNCONDITIONALLY. It will get the NEW secrets if rotation happened,
+    # or the CURRENT secrets if rotation was skipped.
+    - name: Retrieve the DEFINITIVE secrets for this run
+      uri:
+        url: "{{ vault_addr }}/v1/{{ vault_secret_mount }}/data/{{ vault_secret_path }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        status_code: 200
+      register: final_vm_secrets
+      no_log: true
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set final password facts for all hosts
+      set_fact:
+        pwd_admin_local: "{{ final_vm_secrets.json.data.data.admin_local }}"
+        pwd_root: "{{ final_vm_secrets.json.data.data.root }}"
+      no_log: true
+      run_once: true
+      delegate_to: localhost
+
+  # --- STAGE 5: ENFORCEMENT ---
+  # This block runs on all hosts, using the facts set in the previous stage.
+  tasks:
+    - name: Ensure parent home directory /home2 exists and has correct permissions
+      ansible.builtin.file:
+        path: /home2
+        state: directory
+        mode: '0755'
+
+    - name: Ensure the 'admin_local' group exists
+      ansible.builtin.group:
+        name: admin_local
+        state: present
+
+    - name: Ensure user 'admin_local' is present
+      ansible.builtin.user:
+        name: admin_local
+        password: "{{ pwd_admin_local | password_hash('sha512') }}"
+        update_password: always
+        home: /home2/admin_local
+        groups: admin_local,wheel
+        shell: /bin/bash
+        state: present
+        create_home: true
+      no_log: true
+
+    - name: Allow 'admin_local' user to run all commands with sudo (password required)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/admin_local
+        content: 'admin_local ALL=(ALL) ALL'
+        mode: '0440'
+        validate: 'visudo -csf %s'
+
+    - name: Set the password for the 'root' user
+      ansible.builtin.user:
+        name: root
+        password: "{{ pwd_root | password_hash('sha512') }}"
+        update_password: always
+      no_log: true
