@@ -1,0 +1,64 @@
+### This simpler play uses the URI module to reach out to your organizations RedHat Satellite Server and grab all registered hosts
+---
+- name: Generate Static Inventory from Satellite
+  hosts: localhost
+  gather_facts: false
+  connection: local
+
+  vars_prompt:
+    - name: "satellite_server_hostname"
+      prompt: "Enter your Satellite server hostname (e.g., satellite-server.example.com)"
+      private: no
+    - name: "satellite_user"
+      prompt: "Enter your Satellite username"
+      private: no
+    - name: "satellite_password"
+      prompt: "Enter your Satellite password or Personal Access Token"
+      private: yes
+
+  tasks:
+    - name: Ensure the server URL starts with https://
+      set_fact:
+        final_url: "{{ 'https://' ~ satellite_server_hostname if not satellite_server_hostname.startswith('http') else satellite_server_hostname }}"
+
+    - name: Call Satellite API to get all hosts in one page
+      uri:
+        url: "{{ final_url }}/api/v2/hosts?per_page=500" # Need to ask for a large number to ensure you get all servers that are subscribed
+        method: GET
+        user: "{{ satellite_user }}"
+        password: "{{ satellite_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        return_content: yes
+        timeout: 120 # Keeping a generous timeout just in case, if API call takes a while it can timeout and fail
+      register: satellite_api_result
+
+    - name: Check if API call was successful
+      fail:
+        msg: "API call failed. Status: {{ satellite_api_result.status }}. Message: {{ satellite_api_result.msg | default('No message') }}"
+      when: satellite_api_result.status != 200
+
+    - name: Check if any hosts were returned
+      fail:
+        msg: "API call succeeded, but no hosts were found."
+      when: satellite_api_result.json.results | length == 0
+
+    - name: Create a header for the inventory file
+      lineinfile:
+        path: "./all_hosts.ini"
+        line: "[satellite_hosts]"
+        create: yes
+        mode: '0644'
+
+    - name: Add each discovered host to the all_hosts.ini file
+      lineinfile:
+        path: "./all_hosts.ini"
+        line: "{{ item.name }}"
+      # The host list from the API is in the 'results' key
+      loop: "{{ satellite_api_result.json.results }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Report success
+      debug:
+        msg: "Successfully generated inventory file: all_hosts.ini. Found {{ satellite_api_result.json.results | length }} hosts."
