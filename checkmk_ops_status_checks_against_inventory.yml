@@ -1,0 +1,72 @@
+### For other people to use this you'll need to tailor it for your environment, basically just your vars.
+
+### I have a way cooler version of this that outputs this data to a webhook and posts in my teams instant messaging channel daily at 8 AM. Its pretty slick NGL.
+
+---
+- name: Query Checkmk Host Statuses
+  hosts: all
+  gather_facts: false
+
+  # References my vault.yml in the cloned down directory
+  vars_files:
+    - ~/ansible-playbooks/vault.yml
+
+  # Prompts for environment details; Defaults set to the API K8s access point that bypasses F5/keycloak/GCDS, no need to go out to come back in.
+  vars_prompt:
+    - name: cmk_host
+      prompt: "Enter the Checkmk Server FQDN"
+      default: "checkmk.example.domain"
+      private: false
+    - name: cmk_site
+      prompt: "Enter the Checkmk Site Name"
+      default: "cmk" #This will be dependent on whatever you named your site upon setting up checkmk
+      private: false
+
+  tasks:
+    - name: Fetch service statuses from Checkmk API #Includes JSON filters to show data in a certain way for visualization
+      ansible.builtin.uri:
+        url: "https://{{ cmk_host }}/{{ cmk_site }}/check_mk/api/1.0/domain-types/service/collections/all?columns=state&columns=description&columns=plugin_output&query=%7B%22op%22%3A%22%3D%22%2C%22left%22%3A%22host_name%22%2C%22right%22%3A%22{{ inventory_hostname }}%22%7D"
+        method: GET
+        user: "{{ cmk_ansible_user }}"
+        password: "{{ cmk_ansible_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+        headers:
+          accept: "*/*"
+          Content-Type: "application/json"
+        return_content: yes
+      register: cmk_response
+      delegate_to: localhost
+
+    - name: Parse Service Data
+      ansible.builtin.set_fact:
+        # Checkmk states: 0=OK, 1=WARN, 2=CRIT, 3=UNKNOWN
+        ok_count: "{{ cmk_response.json.value | map(attribute='extensions.state') | select('equalto', 0) | list | length }}"
+        warn_services: "{{ cmk_response.json.value | selectattr('extensions.state', 'equalto', 1) | list }}"
+        crit_services: "{{ cmk_response.json.value | selectattr('extensions.state', 'equalto', 2) | list }}"
+        unkn_services: "{{ cmk_response.json.value | selectattr('extensions.state', 'equalto', 3) | list }}"
+
+    - name: Display Host Service Status Summary
+      ansible.builtin.debug:
+        msg: |
+          ========================================================================================================
+          HOST: {{ inventory_hostname }}
+          SUMMARY: {{ ok_count }} OK | {{ warn_services | length }} WARN | {{ crit_services | length }} CRIT | {{ unkn_services | length }} UNKNOWN
+          ========================================================================================================
+          {% if warn_services | length > 0 or crit_services | length > 0 or unkn_services | length > 0 %}
+          | STATE | SERVICE DESCRIPTION                | PLUGIN OUTPUT
+          |-------|------------------------------------|--------------------------------------------------------
+          {% for svc in crit_services %}
+          | CRIT  | {{"%-34s" | format(svc.extensions.description | truncate(34, True, '...')) }} | {{ svc.extensions.plugin_output | default('') | replace('\n', ' ') | truncate(80, True, '...') }}
+          {% endfor %}
+          {% for svc in warn_services %}
+          | WARN  | {{"%-34s" | format(svc.extensions.description | truncate(34, True, '...')) }} | {{ svc.extensions.plugin_output | default('') | replace('\n', ' ') | truncate(80, True, '...') }}
+          {% endfor %}
+          {% for svc in unkn_services %}
+          | UNKN  | {{"%-34s" | format(svc.extensions.description | truncate(34, True, '...')) }} | {{ svc.extensions.plugin_output | default('') | replace('\n', ' ') | truncate(80, True, '...') }}
+          {% endfor %}
+          {% else %}
+          All services are currently OK.
+          {% endif %}
+          ========================================================================================================
+
