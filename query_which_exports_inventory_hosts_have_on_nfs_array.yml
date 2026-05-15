@@ -1,0 +1,84 @@
+### This play is running some API queries to grab which exports have an inventory file's hostnames listed in the export clients field on the array which serves as a whitelist of sorts for NFS mounts.
+---
+- name: Query Isilon/Powerscale NFS Export Clients and Export to File 
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+
+  vars_prompt:
+    - name: isilon_host
+      prompt: "Enter your Isilon node IP or hostname"
+      private: no
+    - name: isilon_user
+      prompt: "Enter your Isilon username"
+      private: no
+    - name: isilon_password
+      prompt: "Enter your Isilon password"
+      private: yes
+    - name: az_choice
+      prompt: "Select Access Zone:\n  1) Dev-AZ\n  2) Prod-AZ\nEnter choice (1 or 2)"
+      private: no
+
+  vars:
+    api_version: "10"
+    output_file: "isilon_results.txt"
+    inventory_group_to_check: "test_hosts"
+
+  tasks:
+    - name: Initialize or clear the results file
+      ansible.builtin.copy:
+        content: "# Isilon NFS Export Client Matches\n# Playbook run on: {{ ansible_date_time.iso8601 }}\n\n"
+        dest: "{{ output_file }}"
+        mode: '0644'
+
+    - name: Set Access Zone based on user selection
+      ansible.builtin.set_fact:
+        access_zone: "{{ 'Dev-AZ' if az_choice == '1' else 'Prod-AZ' }}"
+      when: az_choice in ['1', '2']
+
+    - name: Fail on invalid Access Zone selection
+      ansible.builtin.fail:
+        msg: "Invalid selection. You must enter '1' for Dev-AZ or '2' for Prod-AZ."
+      when: az_choice not in ['1', '2']
+
+    - name: Get all NFS exports from the specified access zone
+      ansible.builtin.uri:
+        url: "https://{{ isilon_host }}:8080/platform/{{ api_version }}/protocols/nfs/exports?zone={{ access_zone }}"
+        user: "{{ isilon_user }}"
+        password: "{{ isilon_password }}"
+        method: GET
+        validate_certs: no
+        force_basic_auth: yes
+      register: nfs_exports_response
+      ignore_errors: yes
+
+    - name: Fail on API communication errors
+      ansible.builtin.fail:
+        msg: "Failed to communicate with Isilon. Status: {{ nfs_exports_response.status }}, Msg: {{ nfs_exports_response.msg | default('N/A') }}"
+      when: nfs_exports_response.status not in [200]
+
+    - name: Fail if inventory group is not found
+      ansible.builtin.fail:
+        msg: "The inventory group '{{ inventory_group_to_check }}' was not found or the inventory file could not be parsed."
+      when: groups[inventory_group_to_check] is not defined
+
+    - name: Write matches to file
+      when:
+        - nfs_exports_response.json is defined
+        - nfs_exports_response.json.exports is defined
+      loop: "{{ nfs_exports_response.json.exports }}"
+      loop_control:
+        label: "{{ item.paths[0] | default('NO_PATH_DEFINED') }}"
+      vars:
+        # Check if item.clients is a string; if so, split it. If not, use it as a list.
+        isilon_clients: "{{ item.clients.strip().split(',') if item.clients is string else item.clients | default([]) }}"
+        matched_clients: "{{ isilon_clients | intersect(groups[inventory_group_to_check]) }}"
+      ansible.builtin.lineinfile:
+        path: "{{ output_file }}"
+        line: "MATCH | Export ID: {{ item.id }} | Path: {{ item.paths[0] }} | Matched Clients: {{ matched_clients | join(', ') }}"
+        create: yes
+      when: matched_clients | length > 0
+
+    - name: Final message
+      ansible.builtin.debug:
+        msg: "Playbook has completed. Results are in '{{ output_file }}'."
