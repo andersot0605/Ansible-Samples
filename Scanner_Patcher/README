@@ -1,0 +1,61 @@
+This YAML is an automated, end-to-end vulnerability management pipeline leveraging Ansible, A Tenable security scanner, Red Hat Satellite, and OpenBao. Designed for enterprise mission support, it enables zero-touch remediation of non-disruptive packages, dynamic content view promotion, and comprehensive compliance reporting.
+
+
+🛡️ Key Capabilities
+This automation automates the heavy lifting of vulnerability management by directly integrating security scanning with patch deployment.
+Capability	Description:
+*Automated Vulnerability Discovery	Directly queries the Scanner REST API to identify Critical, High, and Medium severity vulnerabilities across the datacenter.
+*Dynamic Content Promotion	Checks Red Hat Satellite for required fix versions and automatically promotes Content Views to the appropriate Lifecycle Environments if patches are missing on the host.
+*Safe Auto-Remediation	Identifies "safe" packages for automatic deployment via DNF while explicitly excluding packages that require a reboot (e.g., kernel, glibc, systemd) to ensure zero mission downtime.
+*Secure Credential Injection	Uses OpenBao (HashiCorp Vault fork) AppRoles within a Jenkins pipeline to inject ephemeral, secure credentials at runtime, leaving no hardcoded secrets in the repository.
+*Stale Data Identification	Cross-references Scanner vulnerability data against local DNF installed packages to flag "Needs Rescan" conditions when a system is already patched but Scanner is outdated.
+
+
+⚙️ Architecture & Playbook Workflow
+The primary automation is driven by scanner_patcher.yml, which is divided into five distinct plays to ensure safe, step-by-step execution:
+
+The 5-Phase Pipeline
+
+Play 0: Global Setup	Initializes global variables, sets up prompt parameters, and ensures target controllers have required Python libraries (e.g., requests).
+
+Play 1: Scanner Interrogation	Constructs the host FQDN and queries the Scanner API. Parses the JSON response to extract RPM packages, affected versions, and required fix versions.
+
+Play 2: Local DNF Checks	Executes consolidated checks on target hosts (bypassing repeated PAM hits) to retrieve DNF upgrades, installed packages, and Subscription Manager identities.
+
+Play 3: Satellite & CV Promotion	Queries the Red Hat Satellite API for exact package availability. Identifies deltas between target environments and automatically promotes Content Views where necessary.
+
+Play 4: Targeted Remediation	Refreshes DNF caches, calculates a safe remediation list (excluding reboot-dependent packages), and executes the DNF updates on the target hosts.
+
+Play 5: Report Distribution	Aggregates all data into a detailed CSV matrix detailing Satellite availability, patch success, reboot requirements, and stale Scanner scans. Emails the final report to stakeholders.
+
+
+🚀 Deployment & Usage
+This project is designed to be executed via a Jenkins CI/CD pipeline.
+Prerequisites
+Ansible Core: 2.16+
+Access: Network connectivity to Scanner, Red Hat Satellite, OpenBao, and target nodes.
+Jenkins Environment: Must support AppRole authentication and the jq utility for parsing JSON tokens.
+Jenkins Pipeline Execution
+
+The Jenkins build script acts as the secure orchestrator for the Ansible playbook. The workflow is as follows:
+Authenticate: Jenkins uses an injected AppRole (BAO_ROLE_ID and BAO_SECRET_ID) to authenticate against the OpenBao API.
+Retrieve Secrets: Pulls runtime secrets (SSH keys, Scanner API keys, Satellite credentials).
+Generate Ephemeral Vars: Writes secrets to a secure, temporary YAML file (/tmp/.bao_vars_$$).
+Execute: Runs ansible-playbook -i ../inventories/automation_targets.ini -e @"$TMP_VARS" scanner_patcher.yml.
+Clean Up: Securely deletes the temporary variables file upon completion.
+
+
+📊 Reporting Details
+Following execution, the system generates and emails scanner_vulnerability_report_[TIMESTAMP].csv. The report provides a granular look at fleet readiness:
+CV Promoted: Indicates if a Content View was automatically advanced for the host's environment.
+Patched: Confirms if the playbook successfully applied the fix via DNF during the current run.
+Needs Rescan: A critical operational metric that outputs "Yes (Already Installed)" if DNF confirms the fixed version is present, but Scanner still flags it as vulnerable.
+
+
+🔒 Security & Compliance
+Operating within Public Sector and IL5 constraints, this project enforces strict security protocols:
+No Hardcoded Secrets: All credentials are dynamically pulled from OpenBao at runtime.
+Least Privilege: Jenkins temporary tokens are scoped exclusively to the VAMPR_Secrets path.
+Auditability: Every package update, API query, and content promotion is logged and reported via the final CSV and Jenkins console output.
+
+Fun Note: Newest feature I am working on is forwarding reports to splunk for aggregation and better visualization of data.
