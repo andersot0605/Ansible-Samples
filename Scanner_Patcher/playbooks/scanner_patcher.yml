@@ -183,6 +183,7 @@
 # ==============================================================================*
 # PLAY 3/5: CHECK SATELLITE FOR ALL UNIQUE PACKAGES
 # ==============================================================================*
+#I use pause: 0.1 on the query satellite API task because it thought I was doing a denial of service attack when I ran a large amount of queries simultaneously. 
 - name: "Play 3/5: Query Red Hat Satellite for Exact Packages"
   hosts: localhost
   connection: local
@@ -457,7 +458,7 @@
         port: 25
         from: "examplegroupemail.exampledomain.com"
         to: "{{ prompt_email_recipient | join(',') }}"
-        subject: "Mission Report: scanner Vulnerability Remediation Tracking"
+        subject: "Mission Report: scanner_patcher Vulnerability Remediation Tracking"
         body: |
           Attached is the vulnerability cross-reference report.
           - CV Promoted: Indicates if a Content View was promoted for the host's Lifecycle environment.
